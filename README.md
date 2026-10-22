@@ -75,6 +75,14 @@ How the detection works: the app is "logged in" when a `sessionKey` cookie is pr
 
 Windows DPAPI encryption is scoped to the Windows user, not to the folder, so the moved session stays valid. Nothing is patched or hijacked.
 
+## Reopening after app updates
+
+Claude and Codex are MSIX packages. When any instance installs an update, Windows force-closes **every** process of the package — the main instance and all profiles go down together, since they run the same exe.
+
+The tool starts a small background watcher (`launcher.pyw --watch`) whenever you launch something. When instances vanish and the package version changes within a few minutes, it reopens exactly the instances that were running, a few seconds apart. Instances you close yourself stay closed: no version change, no relaunch (for Claude it also checks the profile's own log for the forced-shutdown line). The watcher exits on its own once nothing has been running for a few minutes, and logs what it did to `watcher.log`.
+
+To turn it off, add `"auto_relaunch": false` to `state.json`.
+
 ## Usage tracker
 
 Press `9` (works for both Claude and Codex). Each account — the main instance included — gets a block listing every limit it has, with its **own** reset time:

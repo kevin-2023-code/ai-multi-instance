@@ -144,8 +144,7 @@ def _running_probe() -> None:
     global _running, _main_running
     while True:
         try:
-            _running = engine.running_profiles()
-            _main_running = engine.default_slot_running()
+            _running, _main_running = engine.running_instances()
         except Exception:
             pass
         time.sleep(2.0)
@@ -266,8 +265,9 @@ def do_launch(state: State) -> None:
         try:
             engine.launch_default_slot()
             state.status = f"{GREEN}✓ launched the main instance{RESET}"
-        except RuntimeError as e:
+        except (OSError, RuntimeError) as e:
             state.status = f"{RED}{e}{RESET}"
+        engine.start_watcher()
         return
     names = state.targets()
     if not names:
@@ -276,10 +276,11 @@ def do_launch(state: State) -> None:
     for n in names:
         try:
             engine.launch_profile(n)
-        except RuntimeError as e:
+        except (OSError, RuntimeError) as e:
             errs.append(f"{n}: {e}")
     state.status = (f"{RED}{'; '.join(errs)}{RESET}" if errs
                     else f"{GREEN}✓ launched {', '.join(names)}{RESET}")
+    engine.start_watcher()
 
 
 def do_close(state: State) -> None:
@@ -730,6 +731,7 @@ def main() -> int:
     except (AttributeError, ValueError):
         pass
     _recover_interrupted()
+    engine.start_watcher()  # covers instances already running from earlier
     _hide_cursor()
     try:
         loop()
