@@ -1,6 +1,7 @@
 """Headless launcher for Claude/Codex profiles. No console window.
 
   launcher.pyw --app=<key> "<profile-name>"  -> open profile in that app
+  launcher.pyw --watch                        -> run the update watcher (watcher.py)
 
 The --app flag is added automatically by desktop shortcuts. If absent, Claude
 is assumed.
@@ -36,6 +37,10 @@ def _parse_args(argv: list[str]) -> tuple[engine.App | None, list[str]]:
 
 
 def main() -> int:
+    if "--watch" in sys.argv[1:]:
+        import watcher
+        return watcher.run()
+
     app, args = _parse_args(sys.argv[1:])
     if app is None:
         app = engine.CLAUDE  # last-resort default
@@ -56,9 +61,10 @@ def main() -> int:
 
     try:
         engine.launch_profile(name, exe=exe)
-    except RuntimeError as e:
+    except (OSError, RuntimeError) as e:
         _error(str(e), f"{app.display} Multi-Instance")
         return 1
+    engine.start_watcher()
     return 0
 
 

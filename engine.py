@@ -193,7 +193,23 @@ def app_version(exe: Path | None) -> str:
         return "?"
 
 
+def _launchable_exe(exe: Path | None, app: App) -> Path:
+    """`exe` if it still exists, else a fresh lookup. An MSIX update moves the
+    old install to WindowsApps\\Deleted, so a path cached before the update is
+    gone and Popen on it would raise FileNotFoundError."""
+    exe = exe or find_app_exe(app=app)
+    if exe is None or not exe.is_file():
+        exe = find_app_exe(refresh=True, app=app)
+    if exe is None:
+        raise RuntimeError(f"{app.display} not found. Is the desktop app installed?")
+    return exe
+
+
 # --- Profiles ------------------------------------------------------------- #
+def profiles_dir(app: App | None = None) -> Path:
+    return PROJECT_DIR / (app or _current).profiles_dirname
+
+
 def list_profiles() -> list[Path]:
     if not PROFILES_DIR.is_dir():
         return []
@@ -299,14 +315,17 @@ def _kill_pids(pids: list[int]) -> int:
     return killed
 
 
-def running_profiles() -> dict[str, list[int]]:
-    """Return {profile_name: [pids]} for processes of the current app using
-    one of our --user-data-dir paths."""
+def running_profiles(app: App | None = None,
+                     procs: list[tuple[int, str, str]] | None = None) -> dict[str, list[int]]:
+    """Return {profile_name: [pids]} for processes of `app` (default: the
+    current one) using one of our --user-data-dir paths. `procs` reuses an
+    earlier _processes() result instead of querying again."""
+    app = app or _current
     result: dict[str, list[int]] = {}
     flag = "--user-data-dir="
-    profiles_root = str(PROFILES_DIR).lower()
+    profiles_root = str(profiles_dir(app)).lower()
 
-    for pid, _exe, cmd in _processes(_current.exe_name):
+    for pid, _exe, cmd in procs if procs is not None else _processes(app.exe_name):
         idx = cmd.lower().find(flag)
         if idx == -1:
             continue
@@ -327,31 +346,38 @@ def running_profiles() -> dict[str, list[int]]:
     return result
 
 
+def running_instances(app: App | None = None) -> tuple[dict[str, list[int]], bool]:
+    """(running_profiles, main instance running) from a single process query."""
+    app = app or _current
+    procs = _processes(app.exe_name)
+    return running_profiles(app, procs), default_slot_running(app, procs)
+
+
 def close_profile(name: str) -> int:
     return _kill_pids(running_profiles().get(name, []))
 
 
-def profile_env(name: str) -> dict[str, str]:
-    """Return the environment Popen should use for `name` under the current app.
-    Adds every per-profile env override defined on the app (e.g. CODEX_HOME,
-    CODEX_ELECTRON_USER_DATA_PATH)."""
+def profile_env(name: str, app: App | None = None) -> dict[str, str]:
+    """Return the environment Popen should use for `name` under `app` (default:
+    the current one). Adds every per-profile env override defined on the app
+    (e.g. CODEX_HOME, CODEX_ELECTRON_USER_DATA_PATH)."""
+    app = app or _current
     env = dict(os.environ)
-    for var, sub in _current.env_overrides:
-        target = PROFILES_DIR / name / sub
+    for var, sub in app.env_overrides:
+        target = profiles_dir(app) / name / sub
         target.mkdir(parents=True, exist_ok=True)
         env[var] = str(target)
     return env
 
 
-def launch_profile(name: str, exe: Path | None = None) -> None:
-    exe = exe or find_app_exe()
-    if exe is None:
-        raise RuntimeError(f"{_current.display} not found. Is the desktop app installed?")
-    data_dir = PROFILES_DIR / name
+def launch_profile(name: str, exe: Path | None = None, app: App | None = None) -> None:
+    app = app or _current
+    exe = _launchable_exe(exe, app)
+    data_dir = profiles_dir(app) / name
     data_dir.mkdir(parents=True, exist_ok=True)
     subprocess.Popen(
         [str(exe), f"--user-data-dir={data_dir}"],
-        env=profile_env(name),
+        env=profile_env(name, app),
         creationflags=DETACHED_FLAGS, close_fds=True,
         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
@@ -423,13 +449,15 @@ def _is_packaged_exe(exe_path: str, app: App) -> bool:
         return False
 
 
-def default_slot_pids() -> list[int]:
+def default_slot_pids(app: App | None = None,
+                      procs: list[tuple[int, str, str]] | None = None) -> list[int]:
     """Main processes of the desktop app running on the default slot: the
     packaged exe itself, with no --user-data-dir (so %APPDATA% state) and no
     --type= (Chromium children)."""
+    app = app or _current
     pids: list[int] = []
-    for pid, exe_path, cmd in _processes(_current.exe_name):
-        if not _is_packaged_exe(exe_path, _current):
+    for pid, exe_path, cmd in procs if procs is not None else _processes(app.exe_name):
+        if not _is_packaged_exe(exe_path, app):
             continue
         low = cmd.lower()
         if "--user-data-dir=" not in low and "--type=" not in low:
@@ -437,10 +465,34 @@ def default_slot_pids() -> list[int]:
     return pids
 
 
+def _pids_running_from(folder: Path) -> list[int]:
+    """PIDs whose executable lives under `folder`. Catches helpers that sit in
+    the default slot but are spawned by OTHER programs — e.g. Chrome's Claude
+    extension runs <slot>\\ChromeNativeHost\\chrome-native-host.exe as a child
+    of chrome.exe, so a tree-kill of the app misses it and its locked exe
+    blocks moving the slot."""
+    try:
+        out = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "$r=$env:MI_FOLDER.TrimEnd('\\')+'\\';"
+             "Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -and "
+             "$_.ExecutablePath.StartsWith($r, [StringComparison]::OrdinalIgnoreCase) } "
+             "| ForEach-Object { $_.ProcessId }"],
+            env=dict(os.environ, MI_FOLDER=str(folder)),
+            capture_output=True, text=True, timeout=15, creationflags=NO_WINDOW,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return [int(s) for s in out.stdout.split() if s.strip().isdigit()]
+
+
 def close_default_slot(*, wait: float = 0.0) -> int:
     """Force-kill the default-slot processes. When `wait` > 0, block until they
     are actually gone (or the timeout elapses) so the folder can be moved."""
     n = _kill_pids(default_slot_pids())
+    slot = default_slot_dir()
+    if slot is not None and slot.is_dir():
+        n += _kill_pids(_pids_running_from(slot))
     if wait > 0:
         deadline = time.monotonic() + wait
         while default_slot_pids() and time.monotonic() < deadline:
@@ -448,15 +500,14 @@ def close_default_slot(*, wait: float = 0.0) -> int:
     return n
 
 
-def default_slot_running() -> bool:
-    return bool(default_slot_pids())
+def default_slot_running(app: App | None = None,
+                         procs: list[tuple[int, str, str]] | None = None) -> bool:
+    return bool(default_slot_pids(app, procs))
 
 
-def launch_default_slot(exe: Path | None = None) -> None:
+def launch_default_slot(exe: Path | None = None, app: App | None = None) -> None:
     """Launch the app on its default slot (no --user-data-dir)."""
-    exe = exe or find_app_exe()
-    if exe is None:
-        raise RuntimeError(f"{_current.display} not found. Is the desktop app installed?")
+    exe = _launchable_exe(exe, app or _current)
     subprocess.Popen(
         [str(exe)],
         creationflags=DETACHED_FLAGS, close_fds=True,
@@ -627,3 +678,39 @@ def delete_shortcut(name: str) -> bool:
         return True
     except OSError:
         return False
+
+
+# --- Auto-relaunch after app updates (see watcher.py) ---------------------- #
+WATCHER_LOG = PROJECT_DIR / "watcher.log"
+CREATE_BREAKAWAY_FROM_JOB = 0x01000000
+
+
+def auto_relaunch_enabled() -> bool:
+    """On unless state.json sets "auto_relaunch": false."""
+    return _load_state().get("auto_relaunch", True) is not False
+
+
+def start_watcher() -> None:
+    """Spawn the background watcher that reopens instances an app update
+    closed. Cheap to call often: the watcher is single-instance and exits on
+    its own once nothing has been running for a while."""
+    if not auto_relaunch_enabled():
+        return
+    if getattr(sys, "frozen", False):
+        if not LAUNCHER_EXE.is_file():
+            return
+        cmd = [str(LAUNCHER_EXE), "--watch"]
+    else:
+        cmd = [pythonw_path(), str(LAUNCHER), "--watch"]
+    # Break away from the caller's job object when allowed, so closing the
+    # terminal that runs main.py doesn't take the watcher down with it.
+    for flags in (DETACHED_FLAGS | CREATE_BREAKAWAY_FROM_JOB, DETACHED_FLAGS):
+        try:
+            subprocess.Popen(
+                cmd, cwd=str(PROJECT_DIR),
+                creationflags=flags, close_fds=True,
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            return
+        except OSError:
+            continue
