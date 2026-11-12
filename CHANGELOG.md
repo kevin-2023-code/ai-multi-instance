@@ -2,6 +2,7 @@
 
 ## Fork — 2026-11-12
 
+- Re-signing an existing profile swaps only the login entries (`Network/`, `Local State`, sign-in keys of `config.json`) instead of deleting the profile, so Claude Code sessions and settings survive a re-login.
 - Merge upstream v2.0.1 into the fork, keeping the auto-relaunch watcher.
 - Claude 5.x tracks `Local\Claude-Data\<family>` by NTFS file ID and keeps using it even when empty, so the snapshot sign-in now swaps that folder's contents in place instead of renaming it. Older layouts still move by rename.
 

@@ -95,6 +95,88 @@ class MaintenanceTests(unittest.TestCase):
             engine.stash_default_slot()
         self.assertEqual((backup / "Local State").read_text(), "original")
 
+    def _signed_in_profile(self, account: str) -> Path:
+        profile = self._data(self.profiles / "new-profile", "old-key")
+        (profile / "Network").mkdir()
+        (profile / "Network" / "Cookies").write_text("old-cookie", encoding="utf-8")
+        (profile / "claude-code-sessions").mkdir()
+        (profile / "claude-code-sessions" / "s1.json").write_text("history", encoding="utf-8")
+        (profile / "Local Storage").mkdir()
+        (profile / "config.json").write_text(json.dumps({
+            "locale": "zh-CN", "oauth:tokenCache": "old-token",
+            "dxt:allowlistCache:org-old": "x", "lastKnownAccountUuid": account,
+        }), encoding="utf-8")
+        return profile
+
+    def _fresh_slot(self, slot: Path, account: str) -> None:
+        self._data(slot, "new")
+        (slot / "Network").mkdir(exist_ok=True)
+        (slot / "Network" / "Cookies").write_text("new-cookie", encoding="utf-8")
+        (slot / "config.json").write_text(json.dumps({
+            "oauth:tokenCache": "new-token", "lastKnownAccountUuid": account,
+        }), encoding="utf-8")
+
+    def test_resignin_keeps_profile_sessions_and_swaps_only_login(self) -> None:
+        modern, _, _ = engine.slot_candidates(engine.CLAUDE)
+        self._data(modern, "original")
+        profile = self._signed_in_profile("acct-1")
+        with mock.patch.object(engine, "launch_default_slot",
+                               side_effect=lambda: self._fresh_slot(modern, "acct-1")):
+            self._login_with_launch("ready")
+        self.assertEqual((profile / "claude-code-sessions" / "s1.json").read_text(), "history")
+        self.assertTrue((profile / "Local Storage").is_dir())
+        self.assertEqual((profile / "Local State").read_text(), "new")
+        self.assertEqual((profile / "Network" / "Cookies").read_text(), "new-cookie")
+        cfg = json.loads((profile / "config.json").read_text(encoding="utf-8"))
+        self.assertEqual(cfg["locale"], "zh-CN")
+        self.assertEqual(cfg["oauth:tokenCache"], "new-token")
+        self.assertNotIn("dxt:allowlistCache:org-old", cfg)
+        self.assertFalse((profile / engine._SWAP_DIRNAME).exists())
+        self.assertEqual((modern / "Local State").read_text(), "original")
+        self.assertFalse(engine.has_orphan_backup())
+
+    def test_resignin_with_other_account_drops_old_web_storage(self) -> None:
+        modern, _, _ = engine.slot_candidates(engine.CLAUDE)
+        profile = self._signed_in_profile("acct-1")
+        with mock.patch.object(engine, "launch_default_slot",
+                               side_effect=lambda: self._fresh_slot(modern, "acct-2")):
+            self._login_with_launch("ready")
+        self.assertFalse((profile / "Local Storage").exists())
+        self.assertEqual((profile / "claude-code-sessions" / "s1.json").read_text(), "history")
+        self.assertFalse(any(modern.iterdir()) if modern.is_dir() else False)
+
+    def test_failed_login_swap_puts_old_login_back(self) -> None:
+        modern, _, _ = engine.slot_candidates(engine.CLAUDE)
+        self._fresh_slot(modern, "acct-1")
+        profile = self._signed_in_profile("acct-1")
+        real_move = engine._move_retry
+
+        def flaky(src: Path, dst: Path, timeout: float = 15.0) -> None:
+            if src == modern / "Local State":
+                raise OSError("locked")
+            real_move(src, dst, timeout)
+
+        with mock.patch.object(engine, "_move_retry", side_effect=flaky):
+            with self.assertRaises(OSError):
+                engine._swap_login_into(modern, profile)
+        self.assertEqual((profile / "Network" / "Cookies").read_text(), "old-cookie")
+        self.assertEqual((profile / "Local State").read_text(), "old-key")
+        self.assertEqual(json.loads((profile / "config.json").read_text())["oauth:tokenCache"], "old-token")
+        self.assertEqual((modern / "Network" / "Cookies").read_text(), "new-cookie")
+
+    def _login_with_launch(self, outcome: str) -> None:
+        # Like _login, but keeps a launch_default_slot patch the caller set up.
+        with ExitStack() as stack:
+            for name in ("close_profile", "close_default_slot"):
+                stack.enter_context(mock.patch.object(engine, name))
+            stack.enter_context(mock.patch.object(engine, "default_slot_running", return_value=False))
+            stack.enter_context(mock.patch.object(main, "confirm", return_value=True))
+            stack.enter_context(mock.patch.object(main, "pause"))
+            stack.enter_context(mock.patch.object(main, "_detect_login", return_value=outcome))
+            stack.enter_context(mock.patch.object(usage, "session_snapshot", return_value={"sessionKey": True}))
+            stack.enter_context(mock.patch.object(main.sys, "stdout", new=StringIO()))
+            main.login_flow("new-profile")
+
     def test_relocated_slot_folder_keeps_its_identity(self) -> None:
         # Claude 5.x tracks Claude-Data/<family> by NTFS file ID and keeps using
         # it even when empty; the snapshot flow must swap contents, not rename.

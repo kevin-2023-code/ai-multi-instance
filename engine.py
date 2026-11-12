@@ -757,13 +757,107 @@ def discard_backup() -> None:
         _rmtree(backup)
 
 
+# --- Re-signing an existing profile ---------------------------------------- #
+# A re-sign-in used to delete the whole profile and move the fresh slot in,
+# which threw away everything local: Claude Code sessions, settings, logs. Only
+# a handful of entries actually carry the login:
+#   Network/      the cookie store (sessionKey) and its journal
+#   Local State   the os_crypt key that the cookies and the oauth caches in
+#                 config.json are encrypted with — they must travel together
+#   config.json   oauth token caches + account id (merged, see below)
+# Everything else in the profile stays put.
+LOGIN_ENTRIES = ("Network", "Local State")
+_CONFIG = "config.json"
+_AUTH_CONFIG_PREFIXES = ("oauth:", "dxt:", "lastKnownAccountUuid", "windowSizeWasSignedIn")
+# Web storage cached for the previous account; dropped only when the account changes.
+_WEB_STORAGE_ENTRIES = ("Local Storage", "Session Storage", "IndexedDB", "WebStorage")
+_SWAP_DIRNAME = ".login-swap-old"
+
+
+def _read_json(path: Path) -> dict | None:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _merged_config(old: dict | None, fresh: dict | None) -> dict:
+    """Profile settings from `old`, every login-related key from `fresh`.
+    Old auth keys are dropped even when `fresh` lacks them: they are encrypted
+    with the replaced Local State key and could not be decrypted anyway."""
+    merged = {k: v for k, v in (old or {}).items() if not k.startswith(_AUTH_CONFIG_PREFIXES)}
+    merged.update(fresh or {})
+    return merged
+
+
+def _swap_login_into(slot: Path, profile: Path) -> None:
+    """Replace only the login entries of an existing profile with the fresh
+    slot's. All-or-nothing: the replaced entries wait in a side folder until
+    everything has landed, and go back if any step fails."""
+    stage = profile / _SWAP_DIRNAME
+    if stage.exists():
+        _rmtree_retry(stage)  # leftover of an earlier, already-finished swap
+    stage.mkdir()
+    old_cfg = _read_json(profile / _CONFIG)
+    fresh_cfg = _read_json(slot / _CONFIG)
+    old_acct = (old_cfg or {}).get("lastKnownAccountUuid")
+    new_acct = (fresh_cfg or {}).get("lastKnownAccountUuid")
+    account_changed = bool(old_acct and new_acct and old_acct != new_acct)
+
+    staged: list[str] = []   # entries moved out of the profile into the stage
+    placed: list[str] = []   # entries moved from the slot into the profile
+    try:
+        aside = list(LOGIN_ENTRIES) + [_CONFIG]
+        if account_changed:
+            aside += list(_WEB_STORAGE_ENTRIES)
+        for entry in aside:
+            if (profile / entry).exists():
+                _move_retry(profile / entry, stage / entry)
+                staged.append(entry)
+        for entry in LOGIN_ENTRIES:
+            if (slot / entry).exists():
+                _move_retry(slot / entry, profile / entry)
+                placed.append(entry)
+        tmp = profile / (_CONFIG + ".tmp")
+        tmp.write_text(json.dumps(_merged_config(old_cfg, fresh_cfg), indent=2), encoding="utf-8")
+        os.replace(tmp, profile / _CONFIG)
+        placed.append(_CONFIG)
+    except OSError:
+        for entry in reversed(placed):
+            try:
+                if entry == _CONFIG:
+                    (profile / _CONFIG).unlink()
+                else:
+                    _move_retry(profile / entry, slot / entry)
+            except OSError:
+                pass
+        for entry in reversed(staged):
+            try:
+                _move_retry(stage / entry, profile / entry)
+            except OSError:
+                pass
+        raise
+    _rmtree_retry(stage)
+
+
 def adopt_default_into(name: str) -> None:
-    """Move the default slot's signed-in state into profile `name`,
-    replacing whatever the profile held before."""
+    """Move the default slot's signed-in state into profile `name`. A profile
+    that already holds data keeps it — only its login is replaced (see
+    LOGIN_ENTRIES); a new or empty profile receives the whole slot."""
     slot = default_slot_dir()
     if slot is None or not slot.is_dir():
         raise RuntimeError("No default-slot state to adopt.")
     profile = _profile_path(name)
+    if _is_live_userdata(profile):
+        _swap_login_into(slot, profile)
+        # Leave the slot as empty as a full adopt would; a stashed main
+        # session is put back by restore_default_slot() afterwards.
+        if _is_relocated_slot(slot):
+            _clear_children_retry(slot)
+        else:
+            _rmtree_retry(slot)
+        return
     if profile.exists():
         _rmtree_retry(profile)
     PROFILES_DIR.mkdir(parents=True, exist_ok=True)

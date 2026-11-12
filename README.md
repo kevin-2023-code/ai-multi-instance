@@ -66,6 +66,8 @@ The tool works around this with a snapshot flow (press `2`, Claude only — also
 
 How the detection works: the app is "logged in" when a `sessionKey` cookie is present (the OAuth token in `config.json` is derived from it). The cookie store is locked while the app runs, so the tool can't read it live — instead it watches the cookie database and its SQLite journal/WAL alongside `config.json` (a plain file, readable live). A cookie write immediately before or after OAuth is accepted, while unrelated writes from app startup are ignored. If you close the tool mid sign-in, it detects the interrupted state on next launch and offers to restore or drop the set-aside session.
 
+Re-signing a profile that already has data replaces only its login — `Network/` (the cookie store), `Local State` (the key the cookies are encrypted with) and the sign-in keys of `config.json`. Claude Code sessions, settings and logs stay. If you sign in with a different account, the profile's cached web storage for the old account is dropped too.
+
 Windows DPAPI encryption is scoped to the Windows user, not to the folder, so the moved session stays valid. Nothing is patched or hijacked.
 
 ## Reopening after app updates
